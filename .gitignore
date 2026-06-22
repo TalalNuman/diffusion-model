@@ -1,0 +1,8 @@
+__pycache__/
+.DS_Store
+animal_data/
+animal_datsets.zip
+*.zip
+.gemini/
+.agents/
+*.log
