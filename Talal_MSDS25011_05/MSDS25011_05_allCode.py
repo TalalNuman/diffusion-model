@@ -18,33 +18,33 @@ from torchvision.utils import save_image, make_grid
 # ---------------------------------------------------------
 class AnimalSubsetDataset(Dataset):
     """
-    Custom Dataset to load exactly 20 images from 5 selected animal classes
-    from the unzipped animal_data folder.
+    Custom Dataset to load images from selected animal classes.
+    Uses all available images by default (num_images_per_class=None).
     """
-    def __init__(self, data_path, classes, num_images_per_class=20, transform=None):
+    def __init__(self, data_path, classes, num_images_per_class=None, transform=None):
         self.data_path = data_path
         self.classes = classes
         self.transform = transform
         self.image_paths = []
         self.labels = []
-        
+
         for idx, cls in enumerate(classes):
             cls_dir = os.path.join(data_path, cls)
             if not os.path.isdir(cls_dir):
                 print(f"[Warning] Directory {cls_dir} does not exist.")
                 continue
-            
+
             # Match standard image file formats
             valid_extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
             files = []
             for ext in valid_extensions:
                 files.extend(glob.glob(os.path.join(cls_dir, ext)))
-            
+
             # Sort to keep loading deterministic
             files = sorted(files)
-            
-            # Select exactly 20 images per class
-            cls_files = files[:num_images_per_class]
+
+            # Use all images unless a cap is specified
+            cls_files = files if num_images_per_class is None else files[:num_images_per_class]
             print(f"Loaded {len(cls_files)} images from class '{cls}'")
             
             for file_path in cls_files:
@@ -141,9 +141,9 @@ class ConvBlock(nn.Module):
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_ch)
         self.relu1 = nn.SiLU()
-        
+
         self.time_mlp = nn.Linear(time_emb_dim, out_ch)
-        
+
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
         self.norm2 = nn.GroupNorm(8, out_ch)
         self.relu2 = nn.SiLU()
@@ -152,10 +152,28 @@ class ConvBlock(nn.Module):
         h = self.relu1(self.norm1(self.conv1(x)))
         # Map time embedding to correct channels and add
         time_emb = self.time_mlp(t)
-        time_emb = time_emb[..., None, None] # Broadcast over spatial dims
+        time_emb = time_emb[..., None, None]  # Broadcast over spatial dims
         h = h + time_emb
         h = self.relu2(self.norm2(self.conv2(h)))
         return h
+
+
+class SelfAttention(nn.Module):
+    """
+    Spatial self-attention block. Placed at the bottleneck to capture global context.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads=4, batch_first=True)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        h = h.reshape(B, C, H * W).transpose(1, 2)  # B, HW, C
+        h, _ = self.attn(h, h, h)
+        h = h.transpose(1, 2).reshape(B, C, H, W)
+        return x + h  # Residual connection
 
 
 class SimpleUNet(nn.Module):

@@ -18,10 +18,10 @@ from torchvision.utils import save_image, make_grid
 # ---------------------------------------------------------
 class AnimalSubsetDataset(Dataset):
     """
-    Custom Dataset to load exactly 20 images from 5 selected animal classes
-    from the unzipped animal_data folder.
+    Custom Dataset to load images from selected animal classes.
+    Uses all available images by default (num_images_per_class=None).
     """
-    def __init__(self, data_path, classes, num_images_per_class=20, transform=None):
+    def __init__(self, data_path, classes, num_images_per_class=None, transform=None):
         self.data_path = data_path
         self.classes = classes
         self.transform = transform
@@ -43,8 +43,8 @@ class AnimalSubsetDataset(Dataset):
             # Sort to keep loading deterministic
             files = sorted(files)
             
-            # Select exactly 20 images per class
-            cls_files = files[:num_images_per_class]
+            # Use all images unless a cap is specified
+            cls_files = files if num_images_per_class is None else files[:num_images_per_class]
             print(f"Loaded {len(cls_files)} images from class '{cls}'")
             
             for file_path in cls_files:
@@ -69,8 +69,20 @@ class AnimalSubsetDataset(Dataset):
 # 2. Diffusion Noise Schedule Setup
 # ---------------------------------------------------------
 T = 1000
-# Linear variance schedule as per original DDPM paper
-beta = torch.linspace(1e-4, 0.02, T)
+
+def cosine_beta_schedule(timesteps, s=0.008):
+    """
+    Cosine noise schedule from "Improved Denoising Diffusion Probabilistic Models".
+    Gives a better gradient signal than the linear schedule, especially at low noise levels.
+    """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 0.0001, 0.02)
+
+beta = cosine_beta_schedule(T)
 
 # Useful intermediate coefficients
 alpha = 1. - beta
@@ -158,65 +170,114 @@ class ConvBlock(nn.Module):
         return h
 
 
+class SelfAttention(nn.Module):
+    """
+    Spatial self-attention block. Captures global context at the bottleneck.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads=4, batch_first=True)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        h = h.reshape(B, C, H * W).transpose(1, 2)  # B, HW, C
+        h, _ = self.attn(h, h, h)
+        h = h.transpose(1, 2).reshape(B, C, H, W)
+        return x + h  # Residual connection
+
+
 class SimpleUNet(nn.Module):
     """
-    A lightweight U-Net optimized for quick training and convergence on small image sizes.
+    3-level U-Net with self-attention at the bottleneck.
+    Channels: 64 -> 128 -> 256 -> (bottleneck) -> 128 -> 64 -> 3
     """
-    def __init__(self, time_emb_dim=32):
+    def __init__(self, time_emb_dim=128):
         super().__init__()
-        # Time MLP
+        # Time MLP — project to 4x dim for richer conditioning
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.SiLU()
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim),
         )
-        
-        # Encoder (Downsample)
+
+        # Encoder
         self.down1 = ConvBlock(3, 64, time_emb_dim)
         self.pool1 = nn.MaxPool2d(2)
-        
+
         self.down2 = ConvBlock(64, 128, time_emb_dim)
         self.pool2 = nn.MaxPool2d(2)
-        
-        # Bottleneck
-        self.mid = ConvBlock(128, 128, time_emb_dim)
-        
-        # Decoder (Upsample)
+
+        self.down3 = ConvBlock(128, 256, time_emb_dim)
+        self.pool3 = nn.MaxPool2d(2)
+
+        # Bottleneck + global attention
+        self.mid = ConvBlock(256, 256, time_emb_dim)
+        self.attn = SelfAttention(256)
+
+        # Decoder
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up_conv1 = ConvBlock(128 + 128, 64, time_emb_dim)
-        
+        self.up_conv1 = ConvBlock(256 + 256, 128, time_emb_dim)
+
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up_conv2 = ConvBlock(64 + 64, 64, time_emb_dim)
-        
+        self.up_conv2 = ConvBlock(128 + 128, 64, time_emb_dim)
+
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up_conv3 = ConvBlock(64 + 64, 64, time_emb_dim)
+
         self.out_conv = nn.Conv2d(64, 3, 1)
 
     def forward(self, x, t):
         t_emb = self.time_mlp(t)
-        
-        # Downsample
+
+        # Encoder
         x1 = self.down1(x, t_emb)
-        p1 = self.pool1(x1)
-        
-        x2 = self.down2(p1, t_emb)
-        p2 = self.pool2(x2)
-        
-        # Mid
-        m = self.mid(p2, t_emb)
-        
-        # Upsample & Skip Connections
-        u1 = self.up1(m)
-        c1 = torch.cat((u1, x2), dim=1)
-        h1 = self.up_conv1(c1, t_emb)
-        
-        u2 = self.up2(h1)
-        c2 = torch.cat((u2, x1), dim=1)
-        h2 = self.up_conv2(c2, t_emb)
-        
-        return self.out_conv(h2)
+        x2 = self.down2(self.pool1(x1), t_emb)
+        x3 = self.down3(self.pool2(x2), t_emb)
+
+        # Bottleneck
+        m = self.attn(self.mid(self.pool3(x3), t_emb))
+
+        # Decoder with skip connections
+        h = self.up_conv1(torch.cat([self.up1(m), x3], dim=1), t_emb)
+        h = self.up_conv2(torch.cat([self.up2(h), x2], dim=1), t_emb)
+        h = self.up_conv3(torch.cat([self.up3(h), x1], dim=1), t_emb)
+
+        return self.out_conv(h)
 
 
 # ---------------------------------------------------------
-# 5. Custom Loss Function
+# 5. Exponential Moving Average (EMA)
+# ---------------------------------------------------------
+class EMA:
+    """
+    Maintains a shadow copy of model weights updated with exponential moving average.
+    Using EMA weights for sampling produces significantly more stable and sharper images.
+    """
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {k: v.clone().float() for k, v in model.state_dict().items()}
+
+    def update(self):
+        with torch.no_grad():
+            for k, v in self.model.state_dict().items():
+                self.shadow[k] = self.decay * self.shadow[k] + (1.0 - self.decay) * v.float()
+
+    def apply_shadow(self):
+        """Load EMA weights into model (call before sampling)."""
+        device = next(self.model.parameters()).device
+        self.model.load_state_dict({k: v.to(device) for k, v in self.shadow.items()})
+
+    def restore(self, backup):
+        """Restore original weights after sampling."""
+        self.model.load_state_dict(backup)
+
+
+# ---------------------------------------------------------
+# 6. Custom Loss Function  (was §5)
 # ---------------------------------------------------------
 class CustomLoss(nn.Module):
     """
@@ -305,10 +366,12 @@ def train(args):
     # Ensure save directory exists
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Transformations
+    # Transformations — extra augmentation to stretch the small (644-image) dataset
     train_transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
+        transforms.Resize((int(args.image_size * 1.15), int(args.image_size * 1.15))),
+        transforms.RandomCrop((args.image_size, args.image_size)),
         transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Map to [-1, 1]
     ])
@@ -318,7 +381,7 @@ def train(args):
     dataset = AnimalSubsetDataset(
         data_path=args.data_path,
         classes=selected_classes,
-        num_images_per_class=20,
+        num_images_per_class=None,  # Use all available images
         transform=train_transform
     )
     
@@ -326,65 +389,72 @@ def train(args):
     print(f"Total dataset size: {len(dataset)} | Total batches: {len(dataloader)}")
     
     # Setup model, loss, optimizer
-    model = SimpleUNet(time_emb_dim=64).to(device)
+    model = SimpleUNet(time_emb_dim=128).to(device)
+    ema = EMA(model, decay=0.999)  # 0.9999 is too slow to track for small datasets
     loss_fn = CustomLoss(loss_type=args.loss_type)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
+
     losses = []
-    
+
     print("\n--- Starting Diffusion Training ---")
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
-        
+
         for batch_idx, (x_0, _) in enumerate(dataloader):
             x_0 = x_0.to(device)
             batch_size = x_0.shape[0]
-            
+
             # Sample random timesteps t uniformly
             t = torch.randint(0, T, (batch_size,), device=device).long()
-            
+
             # Sample Gaussian noise
             noise = torch.randn_like(x_0)
-            
+
             # Forward process: get x_t
             x_t = q_sample(x_0, t, noise)
-            
+
             # Predict noise
             predicted_noise = model(x_t, t)
-            
+
             # Custom loss
             loss = loss_fn(predicted_noise, noise)
-            
+
             optimizer.zero_grad()
             loss.backward()
+            # Clip gradients to prevent instability
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
+            ema.update()
+
             epoch_loss += loss.item()
-            
+
         scheduler.step()
         avg_loss = epoch_loss / len(dataloader)
         losses.append(avg_loss)
-        
+
         # Logs
         if epoch == 1 or epoch % 10 == 0 or epoch == args.epochs:
             print(f"Epoch [{epoch}/{args.epochs}] | Custom Loss: {avg_loss:.5f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-            
-        # Periodic Generation / Visualization
+
+        # Periodic Generation / Visualization using EMA weights
         if epoch % 50 == 0 or epoch == args.epochs:
-            model.eval()
             print(f"Saving samples and checkpoint at epoch {epoch}...")
-            # Generate 10 sample images (2 for each class average style)
+            backup = {k: v.clone() for k, v in model.state_dict().items()}
+            ema.apply_shadow()
+            model.eval()
             samples = sample_images(model, n_samples=10, img_size=args.image_size, device=device)
+            ema.restore(backup)
             grid = make_grid(samples, nrow=5)
             save_image(grid, os.path.join(args.output_dir, f"samples_epoch_{epoch}.png"))
-            
-            # Save checkpoint
+
+            # Save checkpoint (both model and EMA shadow weights)
             checkpoint_path = os.path.join(args.output_dir, "diffusion_model.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'ema_shadow': ema.shadow,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'losses': losses
             }, checkpoint_path)
@@ -412,9 +482,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train custom DDPM diffusion model on animal subset.")
     parser.add_argument('--data_path', type=str, default='animal_data', help='Path to unzipped dataset root')
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=10, help='Batch size for training (fits 100 images evenly)')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--image_size', type=int, default=64, help='Image resolution (width/height)')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training (lower for 128px to fit memory)')
+    parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('--image_size', type=int, default=128, help='Image resolution (width/height)')
     parser.add_argument('--loss_type', type=str, default='l2', choices=['l1', 'l2'], help='Custom loss type')
     parser.add_argument('--output_dir', type=str, default='saved_models', help='Directory to save outputs')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='Compute hardware device')
